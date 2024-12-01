@@ -1,5 +1,5 @@
 require 'sinatra/base'
-require 'mysql2'
+require 'mysql2-cs-bind'
 require 'rack-flash'
 require 'shellwords'
 require 'rack/session/dalli'
@@ -56,7 +56,7 @@ module Isuconp
       end
 
       def try_login(account_name, password)
-        user = db.prepare('SELECT * FROM users WHERE account_name = ? AND del_flg = 0').execute(account_name).first
+        user = db.xquery('SELECT * FROM users WHERE account_name = ? AND del_flg = 0', account_name).first
 
         if user && calculate_passhash(user[:account_name], password) == user[:passhash]
           return user
