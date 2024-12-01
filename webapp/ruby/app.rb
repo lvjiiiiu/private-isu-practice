@@ -90,9 +90,7 @@ module Isuconp
 
       def get_session_user()
         if session[:user]
-          db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-            session[:user][:id]
-          ).first
+          db.xquery('SELECT * FROM `users` WHERE `id` = ?', session[:user][:id]).first
         else
           nil
         end
@@ -100,22 +98,21 @@ module Isuconp
 
       def make_posts(results, all_comments: false)
         posts = []
+        # 取得したresults全件に対しeach
         results.to_a.each do |post|
-          post[:comment_count] = db.prepare('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?').execute(
-            post[:id]
-          ).first[:count]
+          # postに対するcommentsのcountを取得、comment_countに入れ込む
+          post[:comment_count] = db.xquery('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', post[:id]).first[:count]
 
+          # コメントを取得、all_commentsがfalseであればLIMIT 3
           query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
           unless all_comments
             query += ' LIMIT 3'
           end
-          comments = db.prepare(query).execute(
-            post[:id]
-          ).to_a
+          comments = db.xquery(query, post[:id]).to_a
+          # 取得したcommentsに対するeach
           comments.each do |comment|
-            comment[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-              comment[:user_id]
-            ).first
+            # commentしたuserを取得
+            comment[:user] = db.xquery('SELECT * FROM `users` WHERE `id` = ?', comment[:user_id]).first
           end
           post[:comments] = comments.reverse
 
@@ -195,7 +192,7 @@ module Isuconp
         return
       end
 
-      user = db.prepare('SELECT 1 FROM users WHERE `account_name` = ?').execute(account_name).first
+      user = db.xquery('SELECT 1 FROM users WHERE `account_name` = ?', account_name).first
       if user
         flash[:notice] = 'アカウント名がすでに使われています'
         redirect '/register', 302
@@ -238,26 +235,18 @@ module Isuconp
     end
 
     get '/@:account_name' do
-      user = db.prepare('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0').execute(
-        params[:account_name]
-      ).first
+      user = db.xquery('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', params[:account_name]).first
 
       if user.nil?
         return 404
       end
 
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC').execute(
-        user[:id]
-      )
+      results = db.xquery('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC', user[:id])
       posts = make_posts(results)
 
-      comment_count = db.prepare('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?').execute(
-        user[:id]
-      ).first[:count]
+      comment_count = db.xquery('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', user[:id]).first[:count]
 
-      post_ids = db.prepare('SELECT `id` FROM `posts` WHERE `user_id` = ?').execute(
-        user[:id]
-      ).map{|post| post[:id]}
+      post_ids = db.xquery('SELECT `id` FROM `posts` WHERE `user_id` = ?', user[:id]).map{|post| post[:id]}
       post_count = post_ids.length
 
       commented_count = 0
@@ -275,18 +264,15 @@ module Isuconp
 
     get '/posts' do
       max_created_at = params['max_created_at']
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC').execute(
-        max_created_at.nil? ? nil : Time.iso8601(max_created_at).localtime
-      )
+      results = 
+        db.xquery('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC', max_created_at.nil? ? nil : Time.iso8601(max_created_at).localtime)
       posts = make_posts(results)
 
       erb :posts, layout: false, locals: { posts: posts }
     end
 
     get '/posts/:id' do
-      results = db.prepare('SELECT * FROM `posts` WHERE `id` = ?').execute(
-        params[:id]
-      )
+      results = db.xquery('SELECT * FROM `posts` WHERE `id` = ?', params[:id])
       posts = make_posts(results, all_comments: true)
 
       return 404 if posts.length == 0
