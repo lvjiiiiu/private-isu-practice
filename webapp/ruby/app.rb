@@ -101,20 +101,38 @@ module Isuconp
         # 取得したresults全件に対しeach
         results.to_a.each do |post|
           # postに対するcommentsのcountを取得、comment_countに入れ込む
-          post[:comment_count] = db.xquery('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', post[:id]).first[:count]
+          cached_comments_counts = memcached.get("comments.#{post[:id]}.count")
+          if cached_comments_counts
+            post[:comment_count]  = cached_comments_counts.to_i
+          else
+            post[:comment_count]  = db.xquery('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', post[:id]).first[:count]
+            memcached.set("comments.#{post[:id]}.count", post[:comment_count], 10) # membcachedに値をセット
+          end
 
-          # コメントを取得、all_commentsがfalseであればLIMIT 3
-          query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
-          unless all_comments
-            query += ' LIMIT 3'
+          cached_comments = membcached.get("comments#{post[:id]}.#{all_comments.to_s}")
+          if cached_comments
+            post[:comments] = cached_comments
+          else
+            # コメントを取得、all_commentsがfalseであればLIMIT 3
+            query =
+              'SELECT `commencts`.`comment`, `comments`.`created_at`, `users.accout_name`
+                FROM `comments`
+                INNER JOIN users ON `comments`.`user_id` = `users`.`id`
+                WHERE `post_id` = ?
+                ORDER BY `created_at` DESC'
+            unless all_comments
+              query += ' LIMIT 3'
+            end
+            comments = db.xquery(query, post[:id]).to_a
+            # 取得したcommentsに対するeach
+            comments.each do |comment|
+              # commentしたuserを取得
+              comment[:user] = { account_name: comment[:account_name] }
+            end
+            post[:comments] = comments.reverse
+
+            membcached.set("comments#{post[:id]}.#{all_comments.to_s}", post[:comments], 10)
           end
-          comments = db.xquery(query, post[:id]).to_a
-          # 取得したcommentsに対するeach
-          comments.each do |comment|
-            # commentしたuserを取得
-            comment[:user] = db.xquery('SELECT * FROM `users` WHERE `id` = ?', comment[:user_id]).first
-          end
-          post[:comments] = comments.reverse
 
           # postしたuserを取得
           post[:user] = {
