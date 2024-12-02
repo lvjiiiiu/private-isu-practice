@@ -1,8 +1,9 @@
 require 'sinatra/base'
-require 'mysql2'
+require 'mysql2-cs-bind'
 require 'rack-flash'
 require 'shellwords'
 require 'rack/session/dalli'
+require 'openssl'
 
 module Isuconp
   class App < Sinatra::Base
@@ -56,7 +57,7 @@ module Isuconp
       end
 
       def try_login(account_name, password)
-        user = db.prepare('SELECT * FROM users WHERE account_name = ? AND del_flg = 0').execute(account_name).first
+        user = db.xquery('SELECT * FROM users WHERE account_name = ? AND del_flg = 0', account_name).first
 
         if user && calculate_passhash(user[:account_name], password) == user[:passhash]
           return user
@@ -76,8 +77,7 @@ module Isuconp
       end
 
       def digest(src)
-        # opensslのバージョンによっては (stdin)= というのがつくので取る
-        `printf "%s" #{Shellwords.shellescape(src)} | openssl dgst -sha512 | sed 's/^.*= //'`.strip
+        penSSL::Digest::SHA512.hexdigest(src)
       end
 
       def calculate_salt(account_name)
@@ -90,9 +90,7 @@ module Isuconp
 
       def get_session_user()
         if session[:user]
-          db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-            session[:user][:id]
-          ).first
+          db.xquery('SELECT * FROM `users` WHERE `id` = ?', session[:user][:id]).first
         else
           nil
         end
@@ -100,31 +98,47 @@ module Isuconp
 
       def make_posts(results, all_comments: false)
         posts = []
+        # 取得したresults全件に対しeach
         results.to_a.each do |post|
-          post[:comment_count] = db.prepare('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?').execute(
-            post[:id]
-          ).first[:count]
-
-          query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
-          unless all_comments
-            query += ' LIMIT 3'
+          # postに対するcommentsのcountを取得、comment_countに入れ込む
+          cached_comments_counts = memcached.get("comments.#{post[:id]}.count")
+          if cached_comments_counts
+            post[:comment_count]  = cached_comments_counts.to_i
+          else
+            post[:comment_count]  = db.xquery('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', post[:id]).first[:count]
+            memcached.set("comments.#{post[:id]}.count", post[:comment_count], 10) # membcachedに値をセット
           end
-          comments = db.prepare(query).execute(
-            post[:id]
-          ).to_a
-          comments.each do |comment|
-            comment[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-              comment[:user_id]
-            ).first
+
+          cached_comments = membcached.get("comments#{post[:id]}.#{all_comments.to_s}")
+          if cached_comments
+            post[:comments] = cached_comments
+          else
+            # コメントを取得、all_commentsがfalseであればLIMIT 3
+            query =
+              'SELECT `commencts`.`comment`, `comments`.`created_at`, `users.accout_name`
+                FROM `comments`
+                INNER JOIN users ON `comments`.`user_id` = `users`.`id`
+                WHERE `post_id` = ?
+                ORDER BY `created_at` DESC'
+            unless all_comments
+              query += ' LIMIT 3'
+            end
+            comments = db.xquery(query, post[:id]).to_a
+            # 取得したcommentsに対するeach
+            comments.each do |comment|
+              # commentしたuserを取得
+              comment[:user] = { account_name: comment[:account_name] }
+            end
+            post[:comments] = comments.reverse
+
+            membcached.set("comments#{post[:id]}.#{all_comments.to_s}", post[:comments], 10)
           end
-          post[:comments] = comments.reverse
 
-          post[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-            post[:user_id]
-          ).first
-
-          posts.push(post) if post[:user][:del_flg] == 0
-          break if posts.length >= POSTS_PER_PAGE
+          # postしたuserを取得
+          post[:user] = {
+            account_name: post[:account_name],
+          }
+          posts.push(post)
         end
 
         posts
@@ -196,7 +210,7 @@ module Isuconp
         return
       end
 
-      user = db.prepare('SELECT 1 FROM users WHERE `account_name` = ?').execute(account_name).first
+      user = db.xquery('SELECT 1 FROM users WHERE `account_name` = ?', account_name).first
       if user
         flash[:notice] = 'アカウント名がすでに使われています'
         redirect '/register', 302
@@ -224,33 +238,33 @@ module Isuconp
     get '/' do
       me = get_session_user()
 
-      results = db.query('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC')
+      results = db.query(
+        "
+          SELECT  `posts.id`, `posts.user_id`, `posts.body`, `posts.created_at`, `posts.mime`
+          FROM posts INNER JOIN users ON posts.user_id = users.id
+          WHERE users.del_flg = 0
+          ORDER BY `posts.created_at` DESC
+          LIMIT #{POSTS_PER_PAGE};
+        "
+      )
       posts = make_posts(results)
 
       erb :index, layout: :layout, locals: { posts: posts, me: me }
     end
 
     get '/@:account_name' do
-      user = db.prepare('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0').execute(
-        params[:account_name]
-      ).first
+      user = db.xquery('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', params[:account_name]).first
 
       if user.nil?
         return 404
       end
 
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC').execute(
-        user[:id]
-      )
+      results = db.xquery('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC', user[:id])
       posts = make_posts(results)
 
-      comment_count = db.prepare('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?').execute(
-        user[:id]
-      ).first[:count]
+      comment_count = db.xquery('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', user[:id]).first[:count]
 
-      post_ids = db.prepare('SELECT `id` FROM `posts` WHERE `user_id` = ?').execute(
-        user[:id]
-      ).map{|post| post[:id]}
+      post_ids = db.xquery('SELECT `id` FROM `posts` WHERE `user_id` = ?', user[:id]).map{|post| post[:id]}
       post_count = post_ids.length
 
       commented_count = 0
@@ -268,18 +282,15 @@ module Isuconp
 
     get '/posts' do
       max_created_at = params['max_created_at']
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC').execute(
-        max_created_at.nil? ? nil : Time.iso8601(max_created_at).localtime
-      )
+      results = 
+        db.xquery('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC', max_created_at.nil? ? nil : Time.iso8601(max_created_at).localtime)
       posts = make_posts(results)
 
       erb :posts, layout: false, locals: { posts: posts }
     end
 
     get '/posts/:id' do
-      results = db.prepare('SELECT * FROM `posts` WHERE `id` = ?').execute(
-        params[:id]
-      )
+      results = db.xquery('SELECT * FROM `posts` WHERE `id` = ?', params[:id])
       posts = make_posts(results, all_comments: true)
 
       return 404 if posts.length == 0
